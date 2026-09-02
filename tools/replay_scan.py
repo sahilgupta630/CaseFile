@@ -1,15 +1,18 @@
-"""The demo-facing proof that continuous operation's pieces 1-3 (scan, the
-case store, the scheduler) work end to end — without piece 4 (live data
-ingestion, explicitly out of scope; see `docs/continuous-operation-plan.md`).
+"""The demo-facing proof that continuous operation's pieces 1-4 work end to
+end (`docs/continuous-operation-plan.md`).
 
 Mirrors `tools/build_real_case_fixtures.py`'s own `generate()` +
-`build()`-into-a-tempdir pattern, then walks the corpus's own already-existing
-trailing periods one at a time, calling `scan()` per period against a tempdir
-case store, printing a transcript in the shape of §11's "daily loop" narrative
-(`docs/01-problem-and-solution.md`). The frozen corpus cannot demonstrate time
-actually advancing — `AS_OF`/`SPAN_END` are fixed constants baked into the
-seed — so this walks the corpus's own real trailing months instead, the same
-substitute `docs/continuous-operation-plan.md`'s design decision 7 names.
+`build()`-into-a-tempdir pattern. Two phases:
+
+1. Walks the corpus's own already-existing trailing periods one at a time,
+   calling `scan()` per period against a tempdir case store, printing a
+   transcript in the shape of §11's "daily loop" narrative
+   (`docs/01-problem-and-solution.md`). The frozen corpus cannot demonstrate
+   time actually advancing by itself — `AS_OF`/`SPAN_END` are fixed constants
+   baked into the seed — so this walks the corpus's own real trailing months.
+2. Calls `data.ingest.ingest_batch()` twice, rebuilding the same warehouse
+   with each batch's own new `as_of`, and scans each newly-arrived period too
+   — the piece the frozen replay above cannot show by itself.
 
     python tools/replay_scan.py
 """
@@ -23,6 +26,7 @@ import duckdb
 
 from casefile import casestore
 from casefile.contract import load_all
+from casefile.data import ingest
 from casefile.data.generator import generate
 from casefile.data.loader import build
 from casefile.llm import StubProvider
@@ -36,25 +40,40 @@ ROOT = Path(__file__).resolve().parents[1]
 #: six contracts each time) without paying a full 12-month replay's cost.
 PERIODS = ["2026-02", "2026-03", "2026-04"]
 
+#: How many new periods to simulate arriving after the frozen walk above.
+INGESTED_BATCHES = 2
+
 
 def main() -> None:
     contracts = load_all(ROOT / "contracts")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
+        raw_dir = tmp_path / "corpus" / "raw"
+        db_path = tmp_path / "warehouse" / "casefile.duckdb"
+        alias_path = ROOT / "data" / "account_alias.csv"
+
         generate(tmp_path / "corpus")
-        db_path = build(
-            raw_dir=tmp_path / "corpus" / "raw",
-            db_path=tmp_path / "warehouse" / "casefile.duckdb",
-            alias_path=ROOT / "data" / "account_alias.csv",
-        )
-        con = duckdb.connect(str(db_path), read_only=True)
+        build(raw_dir=raw_dir, db_path=db_path, alias_path=alias_path)
         store = casestore.connect(tmp_path / "casestore.duckdb")
         try:
-            for period in PERIODS:
-                _replay_one_period(contracts, con, store, period)
+            con = duckdb.connect(str(db_path), read_only=True)
+            try:
+                for period in PERIODS:
+                    _replay_one_period(contracts, con, store, period)
+            finally:
+                con.close()
+
+            print("-- new data arrives --")
+            for _ in range(INGESTED_BATCHES):
+                summary = ingest.ingest_batch(raw_dir)
+                build(raw_dir=raw_dir, db_path=db_path, alias_path=alias_path, as_of=summary.as_of)
+                con = duckdb.connect(str(db_path), read_only=True)
+                try:
+                    _replay_one_period(contracts, con, store, summary.period)
+                finally:
+                    con.close()
         finally:
-            con.close()
             store.close()
 
 

@@ -11,7 +11,7 @@ wearing a stage's name — and the fiscal calendar §14.1 declares.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import duckdb
@@ -288,3 +288,26 @@ def test_the_watermark_is_the_max_across_all_of_a_source_s_tables(
 
         assert stored == expected, f"{source} watermark ignores one of its tables"
         assert counted == rows_expected
+
+
+def test_build_accepts_an_explicit_as_of_and_stamps_it_verbatim(
+    generated: Path, tmp_path: Path
+) -> None:
+    """`as_of` defaults to `scm.AS_OF` (every test above proves that default
+    path unchanged) — this proves the additive override `data/ingest.py`
+    needs actually reaches `meta.watermark.as_of`, not just `build()`'s own
+    signature."""
+    later = datetime(2026, 6, 1, 6, 0, 0)
+    db_path = build(
+        raw_dir=generated / "raw",
+        db_path=tmp_path / "later.duckdb",
+        alias_path=ROOT / "data" / "account_alias.csv",
+        as_of=later,
+    )
+    con = connect(db_path)
+    try:
+        rows = con.execute("SELECT DISTINCT as_of FROM meta.watermark").fetchall()
+        stamped = {row[0] for row in rows}
+    finally:
+        con.close()
+    assert stamped == {later}

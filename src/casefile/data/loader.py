@@ -27,7 +27,7 @@ the arrival time, so its latest event is its watermark.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -80,10 +80,18 @@ def build(
     db_path: Path | str = DEFAULT_DB,
     alias_path: Path | str = DEFAULT_ALIAS,
     test_accounts_path: Path | str = DEFAULT_TEST_ACCOUNTS,
+    as_of: datetime | None = None,
 ) -> Path:
     """Load, conform, and record the watermarks. Rebuilds from scratch — the
     database is derived, `*.duckdb` is gitignored, and a loader that appends to
-    whatever was there before is a loader nobody can reason about."""
+    whatever was there before is a loader nobody can reason about.
+
+    `as_of` is the simulated "now" stamped into `meta.watermark.as_of` —
+    defaults to `scm.AS_OF`, so every caller written before this parameter
+    existed is unaffected. `data/ingest.py` passes its own later `as_of` after
+    appending a new batch, which is what lets the simulated present actually
+    advance rather than staying the one frozen constant forever.
+    """
     raw_dir, db_path, alias_path = Path(raw_dir), Path(db_path), Path(alias_path)
     test_accounts_path = Path(test_accounts_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +107,7 @@ def build(
         _flag_test_accounts(con, test_accounts_path)
         _conform_regions(con)
         _fiscal_calendar(con)
-        _watermarks(con)
+        _watermarks(con, as_of or AS_OF)
     finally:
         con.close()
     return db_path
@@ -264,7 +272,7 @@ def _calendar_rows() -> list[tuple[str, int, int, int, str, int]]:
 # ── Watermarks ────────────────────────────────────────────────────────────────
 
 
-def _watermarks(con: duckdb.DuckDBPyConnection) -> None:
+def _watermarks(con: duckdb.DuckDBPyConnection, as_of: datetime) -> None:
     """§22: one per source, `max(_ingested_at | _synced_at)`.
 
     Per *source*, not per table — a source is what has a refresh cadence, and
@@ -289,7 +297,7 @@ def _watermarks(con: duckdb.DuckDBPyConnection) -> None:
             SELECT '{source}', max(w), sum(n), ?::TIMESTAMP
               FROM ({" UNION ALL ".join(parts)})
             """,
-            [AS_OF.isoformat()],
+            [as_of.isoformat()],
         )
 
 

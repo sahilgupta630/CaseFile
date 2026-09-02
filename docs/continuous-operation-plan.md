@@ -1,4 +1,4 @@
-# Continuous operation — scan, scheduler, case store (pieces 1–3 of 4)
+# Continuous operation — scan, scheduler, case store, incremental ingestion
 
 **Not one of the nine canonical docs** ([docs/README.md](README.md)) — an addendum, same
 convention as [`docs/ada-integration-plan.md`](ada-integration-plan.md). Own step-ID prefix
@@ -16,10 +16,13 @@ never a missing requirement, but the architecture already had the seams for it
 (`contract.refresh.cadence`, per-source `meta.watermark`, a proven provisional/re-run
 mechanism) without the wiring.
 
-Pieces 1–3 (scan, scheduler, case store) are built and verified here. **Piece 4 — live data
-ingestion — stays explicitly out of scope.** The corpus remains the one frozen, seeded
-warehouse every other module already reads; "continuous" means the scan loop is real, tested
-code, not that new data arrives on its own.
+All four pieces (scan, scheduler, case store, incremental ingestion) are built and verified
+here. Piece 4 — simulated incremental ingestion — was deliberately left unscoped when pieces
+1–3 shipped, pending a decision on what "live" should actually mean with no real external
+system reachable from this environment; asked directly, the answer is **simulated incremental
+batches**: extend the generator/loader so new synthetic data genuinely arrives over time
+(append-only), so `meta.watermark` really advances across repeated runs, rather than
+`AS_OF`/`SPAN_END` staying fixed constants forever. See design decisions 11–14 below.
 
 ## Design decisions, validated against real code
 
@@ -119,27 +122,90 @@ code, not that new data arrives on its own.
     matching the treatment `docs/ada-integration-plan.md`'s own out-of-scope findings and
     `docs/DECISIONS.md`'s "Scenario G attempted and deferred" entry already got.
 
-Both open questions from the validation pass were put to the user directly and confirmed:
-**all six contracts per scan** (not narrowed to `net_revenue` first — decision 10 above is a
-direct, measured consequence of that choice), and **real `run_scheduled()` code**, not
-documentation-only.
+Both open questions from the validation pass that shipped pieces 1–3 were put to the user
+directly and confirmed: **all six contracts per scan** (not narrowed to `net_revenue` first —
+decision 10 above is a direct, measured consequence of that choice), and **real
+`run_scheduled()` code**, not documentation-only.
+
+11. **Piece 4 never reconstructs `scm.World()` or calls `generator.generate()`'s `_tables()`
+    pipeline.** Both share one continuous RNG stream across their whole run (`World.rng`
+    inside `_build_accounts`/`_propagate_tickets`, and `generator._tables()`'s own `rng`) —
+    re-entering either with bumped date constants would silently reshuffle bytes for the
+    *already-frozen* span, the exact bug class `docs/DECISIONS.md` already logged once (a
+    shared stream un-churning NORTHWIND). `data/ingest.py` instead operates purely on the raw
+    CSVs already on disk, via the stdlib `csv` module, using RNG streams independently keyed
+    by `(seed, "ingest", period, account_id, ...)` — the same `World.stream()` idiom, never a
+    shared stream. This is the load-bearing safety property the whole module rests on, and it
+    is what makes the module additive: `generate()`'s "same seed, same bytes" contract
+    (`test_two_runs_produce_identical_bytes`) is a self-consistency check between two fresh
+    runs, not a pinned golden hash, so a module that never touches `generate()`'s own default
+    call path cannot break it — proven directly by `tests/test_ingest.py::
+    test_ingesting_never_changes_a_pre_existing_invoice_or_line_row` byte-comparing every
+    pre-existing row before and after.
+
+12. **Per-source scope, deliberately split by what's safe and cheap versus what would need new
+    RNG-sensitive business-event generation** — billing (`net_revenue`'s source) gets a real,
+    if simplified, steady-state invoice continuation (recurring charges flat, usage charges
+    lightly noised via an independently-keyed stream); crm
+    (`gross_renewal_rate`/`expansion_arr`/`new_business_arr`/`nrr`'s source) gets a trivial
+    re-sync of `account.csv`'s own `_synced_at` column, since `_watermarks()` only reads that
+    column (plus `opportunity.csv`'s, untouched) for this source — zero new rows, zero RNG
+    risk, and it mirrors `_accounts()`'s own existing docstring verbatim ("rows that never
+    change still arrive in it"); product_ops (`p1_resolution_time`'s source) is explicitly
+    deferred, since ticket arrival is a discrete process, not a continuation, and a safe
+    version would touch `_propagate_tickets` — the one part of `scm.py` already flagged above
+    as shared-stream-fragile. Measured, not assumed: `p1_resolution_time`'s own
+    `latest_closed_period()` genuinely stays at `2026-04` after ingestion while the other five
+    contracts advance — `tests/test_ingest.py::
+    test_ingest_then_rebuild_advances_the_watermark_scan_sees` checks both halves of that
+    directly. Logged plainly as a real, honest limitation — the same "cheap to cut, deferred,
+    logged" treatment `docs/ada-integration-plan.md`'s ADA-7/8 and Scenario G already got.
+
+13. **`loader.py` gets one small, additive, backward-compatible change:**
+    `build(..., as_of: datetime | None = None)`, threaded into `_watermarks(con, as_of)`,
+    defaulting to `scm.AS_OF` when omitted — every caller written before this parameter
+    existed (`scan.py`, every test, `tools/build_real_case_fixtures.py`, `make data`) passes
+    nothing and is completely unaffected; `tests/test_loader.py::
+    test_build_accepts_an_explicit_as_of_and_stamps_it_verbatim` proves the override path,
+    and every pre-existing `test_loader.py` assertion proves the default path untouched.
+
+14. **A real gap the mutation-testing pass found, not assumed clean: an RNG key missing
+    `account_id` is invisible to both a plain determinism check and a "does dropping an
+    account shift another's output" check.** Because `_continue_line()` builds a fresh
+    `random.Random(...)` object per call rather than advancing one shared object across a
+    loop, a badly-scoped key (e.g. `f"{seed}:ingest:{period}"` alone) is still fully
+    deterministic run-to-run, and dropping an unrelated account doesn't shift anyone else's
+    stream position — it just silently gives every account the *identical* noise multiplier,
+    a different symptom neither of those tests was built to catch. Caught by a dedicated third
+    test, `tests/test_ingest.py::test_different_accounts_usage_lines_get_different_noise`,
+    which compares the actual price-noise ratio applied across different real accounts rather
+    than inspecting the key format — and confirmed the other way too: the first version of
+    that test rounded ratios to 6 decimal places and still saw "variation" under the buggy key,
+    because `unit_new`'s own 2dp rounding produces a small ratio spread purely from different
+    accounts' unit prices even when the underlying random draw is identical; rounding to 3dp
+    fixed the false negative. Both the original mutation (missing `account_id`) and the test's
+    own false-negative were found and fixed before this was counted done.
 
 ## Files — done, verified
 
-571 backend tests pass (`pytest -q`, up from 552 before this work), `ruff check src tests` and
-`mypy src` both clean, `tools/check_ground_truth_isolation.py` and `tools/check_links.py` both
-clean. Every load-bearing piece of logic was mutation-tested by hand before being counted done
-(a real bug introduced on purpose, confirmed caught by a failing test, then reverted) — see
-`docs/DECISIONS.md` for specifics, including one real test-coverage gap the mutation pass
-itself found and closed (the case store's flat columns had no test reading them back at all).
+581 backend tests pass (`pytest -q`, up from 552 before this initiative), `ruff check src
+tests` and `mypy src` both clean, `tools/check_ground_truth_isolation.py` and
+`tools/check_links.py` both clean. Every load-bearing piece of logic was mutation-tested by
+hand before being counted done (a real bug introduced on purpose, confirmed caught by a
+failing test, then reverted) — see `docs/DECISIONS.md` for specifics, including two real
+test-coverage gaps the mutation pass itself found and closed (pieces 1–3's case-store flat
+columns had no test reading them back at all; piece 4's first RNG-independence test had a
+rounding-precision false negative).
 
 | # | Piece | Files | Verify | Status |
 |---|---|---|---|---|
 | CO-1 | Scan — `latest_closed_period`, `regions`, `scan_slice`, `scan` | `src/casefile/scan.py` (new) | `tests/test_scan.py`: period/region lookups (incl. the `>=` month-end boundary), the all-six-contracts sweep (decision 10), the `gate1`-marked slice-level backtest against `test_verify.py`'s own survivors | ✅ |
 | CO-2 | Scheduler — `run_scheduled` | `src/casefile/scan.py` | `tests/test_scan.py`: `iterations=3` with a fake `sleep`, `scan()` itself replaced via `monkeypatch` — zero real wait, zero real `run_case()` cost | ✅ |
 | CO-3 | Case store | `src/casefile/casestore.py` (new) | `tests/test_casestore.py`: round-trip save/load, upsert-not-duplicate, `open_only` filter, priority ordering, flat-column integrity; `tests/test_scan.py`'s cadence-upgrade test proves the store upserts the same `case_id` in place when a provisional case's ceiling lifts (reusing `test_cadence_upgrade.py`'s own watermark-mutation technique) | ✅ |
-| CO-4 | Demo-facing proof | `tools/replay_scan.py` (new), `Makefile` (`scan`/`replay` targets) | `python tools/replay_scan.py` / `make replay` walks 2026-02 → 2026-04 against a fresh generated corpus, printing a §11-shaped transcript; `make scan` runs against the committed warehouse and populates `data/casestore.duckdb` | ✅ |
-| CO-5 | Piece 4 — live data ingestion | — | out of scope, deliberately deferred | not started |
+| CO-4 | Demo-facing proof (frozen periods) | `tools/replay_scan.py` (new), `Makefile` (`scan`/`replay` targets) | `python tools/replay_scan.py` / `make replay` walks 2026-02 → 2026-04 against a fresh generated corpus, printing a §11-shaped transcript; `make scan` runs against the committed warehouse and populates `data/casestore.duckdb` | ✅ |
+| CO-5 | Piece 4 — simulated incremental ingestion | `src/casefile/data/ingest.py` (new) | `tests/test_ingest.py` (9 tests): `next_period()`/chaining, byte-frozen past, churn respected not re-derived, RNG independence (decision 14), end-to-end tie-back into `scan.latest_closed_period()` | ✅ |
+| CO-6 | `loader.build()`'s additive `as_of` parameter | `src/casefile/data/loader.py` | `tests/test_loader.py::test_build_accepts_an_explicit_as_of_and_stamps_it_verbatim` plus every pre-existing test in that file (default path unchanged) | ✅ |
+| CO-7 | Demo-facing proof (new periods) | `tools/replay_scan.py` (extended), `Makefile` (`ingest` target) | `python tools/replay_scan.py` / `make replay` now also ingests and scans two new periods after the frozen walk; `make ingest` (no `data` dependency, so repeated calls chain) runs against the committed warehouse | ✅ |
 
 ## The OS-level production answer (documented, not built)
 
@@ -162,9 +228,13 @@ answer rather than asserted as done.
 1. `pytest -q`, `ruff check src tests`, `mypy src` — same bar as every change this session. ✅
 2. `tools/check_ground_truth_isolation.py`, `tools/check_links.py` — same bar `make check`
    holds every change to. ✅
-3. `python tools/replay_scan.py` runs end to end against a fresh `generate()`+`build()` corpus
-   and produces a real, inspectable transcript. ✅
+3. `python tools/replay_scan.py` runs end to end against a fresh `generate()`+`build()` corpus,
+   walking 3 frozen periods then ingesting and scanning 2 newly-arrived ones, and produces a
+   real, inspectable transcript. ✅
 4. `python -m casefile.scan` (`make scan`) runs against the committed `data/casefile.duckdb`,
    populates `data/casestore.duckdb`, and prints a `ScanSummary`. ✅
+5. `python -m casefile.data.ingest` (`make ingest`), run twice in a row against the committed
+   corpus with no `data` in between, genuinely chains forward two periods (measured: `2026-05`
+   then `2026-06`) and prints an `IngestSummary` each time. ✅
 
 Not committed or pushed — per standing instruction, the exact diff is shown for review first.

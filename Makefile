@@ -4,7 +4,7 @@
 # same order. If those two ever disagree, fixing the divergence outranks every
 # other task in the project.
 
-.PHONY: setup data corpus demo scan replay test check gate0 gate1 gate2 gate3 gate4 gate5 gate6
+.PHONY: setup data corpus demo scan replay ingest test check gate0 gate1 gate2 gate3 gate4 gate5 gate6
 
 setup:
 	pip install -e ".[dev]"
@@ -33,18 +33,29 @@ corpus:
 demo: data
 	python -m casefile.orchestrator
 
-# Continuous operation, pieces 1-3 of 4 (docs/continuous-operation-plan.md).
-# Sweeps every contract x region slice over the committed warehouse's own
-# latest closed period, writing data/casestore.duckdb. StubProvider by
-# default; pass --live for a real provider via provider_from_env().
+# Continuous operation (docs/continuous-operation-plan.md). Sweeps every
+# contract x region slice over the committed warehouse's own latest closed
+# period, writing data/casestore.duckdb. StubProvider by default; pass
+# --live for a real provider via provider_from_env().
 scan: data
 	python -m casefile.scan
 
 # The same mechanism, replayed against the corpus's own last three real
-# trailing months in a tempdir case store — the demo-facing proof pieces 1-3
-# work end to end without live data (piece 4, explicitly out of scope).
+# trailing months, then two simulated newly-arrived ones (piece 4) — the
+# demo-facing proof all four pieces work end to end in a tempdir case store.
 replay: data
 	python tools/replay_scan.py
+
+# Piece 4: append one new period of billing activity (and re-sync crm's
+# account table) on top of data/raw/, then rebuild data/casefile.duckdb with
+# the new watermark. Deliberately does NOT depend on `data` — unlike scan/
+# replay/demo, ingest is meant to be re-run repeatedly, each call chaining
+# one further period onto whatever is already there; depending on `data`
+# would reset raw/ back to the frozen baseline before every call and undo
+# the chaining. Run `make data` once first on a fresh clone. See
+# data/ingest.py.
+ingest:
+	python -m casefile.data.ingest
 
 test:
 	pytest -q
