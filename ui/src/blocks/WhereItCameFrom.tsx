@@ -1,14 +1,9 @@
 import type { ContributionTree } from '../types'
 import { crore, share } from '../format'
+import { WaterfallChart } from './WaterfallChart'
 
 /**
  * Block 2 — §10's decomposition: by KPI, by account, concentration.
- *
- * Renders whatever `by_dimension` the case actually carries rather than
- * hard-coding "kpi" and "account": 1.4 skips a dimension no term of the
- * formula can carry (§14.1's `product` on `net_revenue`, which subtracts
- * credit notes), and a screen that assumed every dimension was present would
- * break on exactly the case that dimension check exists to protect.
  */
 export function WhereItCameFrom({ tree }: { tree: ContributionTree | null }) {
   if (!tree) {
@@ -27,6 +22,14 @@ export function WhereItCameFrom({ tree }: { tree: ContributionTree | null }) {
   return (
     <section aria-labelledby="where-h" data-block="where-it-came-from">
       <h2 id="where-h">Where it came from</h2>
+
+      {/* Waterfall Visualization for Account level contribution */}
+      {tree.by_dimension.account && tree.by_dimension.account.length > 0 && (
+        <div className="decomposition-chart-wrapper">
+          <WaterfallChart data={tree.by_dimension.account} />
+        </div>
+      )}
+
       {Object.entries(tree.by_dimension).map(([dimension, nodes]) => (
         <dl key={dimension} className="contribution" data-dimension={dimension}>
           {nodes.map((node) => (
